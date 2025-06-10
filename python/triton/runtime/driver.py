@@ -4,7 +4,17 @@ from typing import Any, Callable, Generic, TypeVar
 
 
 def _create_driver() -> DriverBase:
+    # by environment variable TRITON_SPIRV_BACKEND, we can select the SPIR-V backend as the active driver.
+    import os:
+    if os.getenv("TRITON_SPIRV_BACKEND", "0") == "1":
+        if "spirv" not in backends:
+            raise RuntimeError("TRITON_SPIRV_BACKEND is set, but the spirv backend is not available.")
+        return backends["spirv"].driver
     active_drivers = [x.driver for x in backends.values() if x.driver.is_active()]
+    # SPIR-V backend is a special case, it's driver should not be used if another GPU backend is active.
+    if len(active_drivers) >= 2 and backends["spirv"].driver.is_active():
+        print("Both SPIR-V and GPU backends are active. Using SPIR-V backend.")
+        active_drivers.remove(backends['spirv'].driver)
     if len(active_drivers) != 1:
         raise RuntimeError(f"{len(active_drivers)} active drivers ({active_drivers}). There should only be one.")
     return active_drivers[0]()
