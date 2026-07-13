@@ -7,16 +7,16 @@ Triton 的 TinyGPU compile-only 后端。
 2. TinyGPU 相关 lowering 以后应该接在哪一层
 3. 第一版怎样尽量做小，便于调试和验证
 
-
-
 """
-
-from triton.backends.compiler import BaseBackend, GPUTarget
+from __future__ import annotations
 
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Dict
 import hashlib
+
+from triton.backends.compiler import BaseBackend, GPUTarget
+from triton._C.libtriton import tinygpu
 
 @dataclass(frozen=True)
 class TinyGPUOptions:
@@ -40,8 +40,8 @@ class TinyGPUOptions:
   debug:      bool = False
 
   """Triton 要求后端选项能生成稳定的 hash。"""
-  def hash(self):
-    key = "_".join([f"{name}-{val}" for k, v in sorted(self.__dict__.items())])
+  def hash(self) -> str:
+    key = "_".join([f"{name}-{value}" for name, value in sorted(self.__dict__.items())])
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
@@ -68,17 +68,18 @@ class TinyGPUBackend(BaseBackend):
   @staticmethod
   def supports_target(target: GPUTarget):
     #  告诉Triton，这个backend 能不能处理当前target
-    return target.basckend == "tinygpu"
+    return target.backend == "tinygpu"
 
   def  __init__(self, target: GPUTarget) -> None:
     super().__init__(target)
 
   def parse_options(self, opts) -> Any:
     # 把Triton传进来的原始dict选项转成类型化对象
-    args = {}
-    for k in TinyGPUOptions.__dataclass_fields__.keys():
-      if k in opts and opts[k] in not None:
-        args[k] == opts[k]
+    args = {
+      name: opts[name]
+      for name in TinyGPUOptions.__dataclass_fields__
+      if name in opts and opts[name] is not None
+    }
     return TinyGPUOptions(**args)
 
   def pack_metadata(self, metadata):
@@ -134,7 +135,8 @@ class TinyGPUBackend(BaseBackend):
     stages["tinyasm"] = self.make_tinyasm
     stages["tinybin"] = self.make_tinybin
 
-  def make_ttir(self, mod, metadata):
+  @staticmethod
+  def make_ttir(mod, metadata):
     """
     后端拿到 Triton 前端结果后的第一阶段。
     对真实后端来说，这里通常会做 backend 自己的 TTIR 清理、规范化
@@ -145,7 +147,14 @@ class TinyGPUBackend(BaseBackend):
     del metadata
     return mod
 
-  def make_tinyasm(self, src, metadata):
+  @staticmethod
+  def _set_metadata(metadata):
+    metadata["name"] = "tinygpu_kernel"
+    metadata["shared"] = 0
+    metadata["cluster_dims"] = (1, 1, 1)
+    metadata["num_warps"] = 1
+
+  def make_tinyasm(self, mod, metadata):
     """
     输出一个可读的占位 TinyGPU 汇编产物。
     同时，这里也会补齐 Triton 的 `CompiledKernel` 后续会依赖的 metadata。
@@ -156,25 +165,19 @@ class TinyGPUBackend(BaseBackend):
     等你开始做真实 lowering 时，这个函数就是最自然的切入点：
     在这里读取 TTIR，然后一步步翻译成 TinyGPU 指令。
     """
-    metadata["name"] = "tinygpu_kernel"
-    metadata["shared"] = 0
-    metadata["cluster_dims"] = (1, 1, 1)
-    metadata["num_warps"] = 1
+    self._set_metadata(metadata)
+    ttir = str(mod)
+    unsupported = ("tt.load", "tt.store", "tt.addptr", "tt.dot", "arith.")
+    if any(operation in ttir for operation in unsupported):
+            raise NotImplementedError(
+                "TinyGPU 第一阶段只支持空 kernel；"
+                "tt.load/tt.store lowering 将在第二阶段实现。"
+            )
+    metadata["tinygpu_binary"] = bytes([0xF0, 0x00])
+    return "RET\n"
 
-    ttir_text = str(mod)
-    lines = [
-      "// TinyGPU placeholder assembly",
-      "// The real backend should lower Triton TTIR into TinyGPU ISA here.",
-      "// Embedded TTIR below makes debugging easier during bring-up.",
-      "// --- BEGIN TTIR ---",
-      *[f"// {line}" for line in ttir_text.splitlines()],
-      "// --- END TTIR ---",
-      "RET",
-      "",
-    ]
-    return "\n".join(lines)
-
-  def make_tinybin(self, src, metadata):
+  @classmethod
+  def make_tinybin(self, assembly, metadata):
     """
     输出一个占位的 16 位 TinyGPU 指令流。
 
@@ -185,8 +188,9 @@ class TinyGPUBackend(BaseBackend):
     等真实指令发射逻辑补上之后，这里就应该消费前面的汇编或结构化中间结果，
     然后返回仿真器真正需要的指令字节流。
     """
-    del src, metadata
-    return bytes([0xF0, 0x00])
+    self._set_metadata(metadata)
+    del assembly
+    return metadata.pop("tinygpu_binary")
 
 
 

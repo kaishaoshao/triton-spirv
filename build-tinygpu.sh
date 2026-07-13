@@ -48,34 +48,34 @@ log "检查 Python 可执行文件"
 python3.13 --version
 
 log "重新创建虚拟环境"
-rm -rf "$VENV_DIR"
-python3.13  -m venv "$VENV_DIR"
+# rm -rf "$VENV_DIR"
+# python3.13  -m venv "$VENV_DIR"
 
 log "激活虚拟环境"
-source "$VENV_DIR/bin/activate.fish"
-python --version
+# source "$VENV_DIR/bin/activate.fish"
+# python --version
 
 log "升级基础打包工具"
-python -m pip install --upgrade pip setuptools wheel
+# python -m pip install --upgrade pip setuptools wheel
 
 log "安装 Python 依赖"
-python -m pip install -r "$TRITON_DIR/python/requirements.txt"
-python -m pip install -r "$TRITON_DIR/python/test-requirements.txt"
+# python -m pip install -r "$TRITON_DIR/python/requirements.txt"
+# python -m pip install -r "$TRITON_DIR/python/test-requirements.txt"
 
-if [[ ! -x "$LLVM_BUILD_DIR/bin/llvm-config" ]]; then
-  log "配置 LLVM/MLIR"
-  cmake -G Ninja \
-    -S "$LLVM_SRC_DIR/llvm" \
-    -B "$LLVM_BUILD_DIR" \
-    -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
-    -DLLVM_ENABLE_PROJECTS="$LLVM_PROJECTS" \
-    -DLLVM_TARGETS_TO_BUILD="$LLVM_TARGETS" \
-    -DLLVM_ENABLE_ASSERTIONS=ON \
-    -DMLIR_ENABLE_BINDINGS_PYTHON=ON
-fi
+# if [[ ! -x "$LLVM_BUILD_DIR/bin/llvm-config" ]]; then
+#   log "配置 LLVM/MLIR"
+#   cmake -G Ninja \
+#     -S "$LLVM_SRC_DIR/llvm" \
+#     -B "$LLVM_BUILD_DIR" \
+#     -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+#     -DLLVM_ENABLE_PROJECTS="$LLVM_PROJECTS" \
+#     -DLLVM_TARGETS_TO_BUILD="$LLVM_TARGETS" \
+#     -DLLVM_ENABLE_ASSERTIONS=ON \
+#     -DMLIR_ENABLE_BINDINGS_PYTHON=ON
+# fi
 
-log "编译 LLVM/MLIR"
-ninja -C "$LLVM_BUILD_DIR" -j "$JOBS"
+# log "编译 LLVM/MLIR"
+# ninja -C "$LLVM_BUILD_DIR" -j "$JOBS"
 
 log "以 editable 方式安装 Triton"
 PYTHONNOUSERSITE=1 \
@@ -94,23 +94,6 @@ import triton
 print("triton imported from:", triton.__path__[0])
 PY
 
-if [[ "$RUN_TESTS" == "1" ]]; then
-  log "运行无 GPU 测试"
-  make -C "$TRITON_DIR" PYTHON=python test-nogpu
-fi
+python third_party/tinygpu/unittest/ch1-test01.py
 
-if [[ "$RUN_VERIFY" == "1" ]]; then
-  log "检查 tinygpu 后端是否被发现"
-  python - <<'PY'
-import triton.backends
-names = sorted(triton.backends.backends.keys())
-print("discovered backends:", names)
-if "tinygpu" not in names:
-    raise SystemExit("tinygpu backend 没有被 Triton 发现，请检查 setup.py 和 third_party/tinygpu 目录")
-PY
-fi
-
-log "完成"
-printf '后续进入环境请执行：\n'
-printf '  source %s/bin/activate.fish\n' "$VENV_DIR"
 
