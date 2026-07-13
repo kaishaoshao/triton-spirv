@@ -26,7 +26,11 @@ test-lit:
 
 .PHONY: test-cpp
 test-cpp:
-	ninja -C $(BUILD_DIR) check-triton-unit-tests
+	@if ninja -C $(BUILD_DIR) -t targets all | grep -q '^check-triton-unit-tests:'; then \
+		ninja -C $(BUILD_DIR) check-triton-unit-tests; \
+	else \
+		echo "Skipping C++ unit tests: check-triton-unit-tests target is not available in $(BUILD_DIR)"; \
+	fi
 
 .PHONY: test-python
 test-unit: all
