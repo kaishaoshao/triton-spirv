@@ -29,8 +29,7 @@ class TinyGPUDriver(DriverBase):
 
     def get_current_target(self):
         """为显式 compile-only 流程返回一个默认 TinyGPU target。"""
-
-        return GPUTarget("tinygpu", "sim", 8)
+        return GPUTarget("tinygpu", "sim", 4)
 
     def get_active_torch_device(self):
         """为了满足接口而保留，虽然现在并没有真实设备。

@@ -16,7 +16,7 @@ from typing import Any, Dict
 import hashlib
 
 from triton.backends.compiler import BaseBackend, GPUTarget
-from triton._C.libtriton import tinygpu
+from triton._C.libtriton import tinygpu, ir, passes
 
 @dataclass(frozen=True)
 class TinyGPUOptions:
@@ -34,9 +34,10 @@ class TinyGPUOptions:
     - ISA
   """
 
-  num_warps:  int = 1
-  num_ctas:   int = 1
-  num_stages: int = 1
+  num_warps:        int = 1
+  num_ctas:         int = 1
+  num_stages:       int = 1
+  threads_per_warp: int = 4
   debug:      bool = False
 
   """Triton 要求后端选项能生成稳定的 hash。"""
@@ -114,27 +115,6 @@ class TinyGPUBackend(BaseBackend):
     """
     del ctx
 
-  def hash(self) -> str:
-    # 返回backend 身份字符串， 参与Triton的缓存key。
-    return f"tinygpu-{self.target.arch}-{self.target.warp_size}"
-
-  def add_stages(self, stages, options):
-    """
-     注册这个 backend 的顺序编译阶段。
-        这里有个很关键的细节：
-        - Triton 的 `ASTSource` 是从 `ttir` 开始接后端的
-        - 所以第一阶段通常就应该叫 `ttir`
-
-        当前最小流水线是：
-        - `ttir`：保留 Triton 生成的 TTIR
-        - `tinyasm`：输出占位的 TinyGPU 汇编
-        - `tinybin`：输出占位的 TinyGPU 二进制
-    """
-    del options
-    stages["ttir"]    = self.make_ttir
-    stages["tinyasm"] = self.make_tinyasm
-    stages["tinybin"] = self.make_tinybin
-
   @staticmethod
   def make_ttir(mod, metadata):
     """
@@ -147,8 +127,41 @@ class TinyGPUBackend(BaseBackend):
     del metadata
     return mod
 
+
+  @staticmethod
+  def make_ttgir(mod, metadate, options):
+    # 将TTIR转为匹配TinyGPU 4线程block的TTGIR
+    del metadate
+    pm = ir.pass_manager(mod.context)
+    # 复用Triton的通用TTIR -> TTGIR 转换； 后端只提供target名称和
+    # 执行模型参数，不使用NVIDIA专属 ttnvgpuir pass
+    passes.ttir.add_convert_to_ttgpuir(
+      pm,
+      f"tinygpu:{options.threads_per_warp}",
+      options.num_warps,
+      options.threads_per_warp,
+      options.num_ctas,
+    )
+    pm.run(mod)
+    return mod
+
+  @staticmethod
+  def make_tinygpuir(mod, metadata):
+    # 运行TTGIR的 TinyGPU C++ pass
+
+    del metadata
+    pm = ir.pass_manager(mod.context)
+    # 该绑定由 triton_tinygpu.cc 注册，最终会创建C++的
+    # LowerTTGIRToTinyGPUPass. 此处输入必须已经是TTGIR
+    tinygpu.passes.ttgpuir.add_to_tinygpu(pm)
+    pm.run(mod)
+    return mod
+
+
+
   @staticmethod
   def _set_metadata(metadata):
+    # 当前没有runtime launcher； 先补齐CompiledKernel读取的最小metadata
     metadata["name"] = "tinygpu_kernel"
     metadata["shared"] = 0
     metadata["cluster_dims"] = (1, 1, 1)
@@ -166,15 +179,14 @@ class TinyGPUBackend(BaseBackend):
     在这里读取 TTIR，然后一步步翻译成 TinyGPU 指令。
     """
     self._set_metadata(metadata)
-    ttir = str(mod)
-    unsupported = ("tt.load", "tt.store", "tt.addptr", "tt.dot", "arith.")
-    if any(operation in ttir for operation in unsupported):
-            raise NotImplementedError(
-                "TinyGPU 第一阶段只支持空 kernel；"
-                "tt.load/tt.store lowering 将在第二阶段实现。"
-            )
-    metadata["tinygpu_binary"] = bytes([0xF0, 0x00])
-    return "RET\n"
+    # C++ pass 把文本产物写入module attribute, Python stage只负责取出并
+    # 交给 Triton 缓存，不在这里重新解析或生成指令
+    # ir.module 没有暴露get_str_attr(); 该函数只绑定普通的 ir.operation。
+    # 因此由TinyGPU的pybind接口读取ModuleOp的StringAttr, 避免修改 Triton
+    # 核心 python bingding，也避免把IR文本解析逻辑放到Python。
+    assembly, binary_hex = tinygpu.passes.ttgpuir.get_outputs(mod)
+    metadata["tinygpu_binary"] = bytes.fromhex(binary_hex)
+    return assembly
 
   @classmethod
   def make_tinybin(self, assembly, metadata):
@@ -189,8 +201,33 @@ class TinyGPUBackend(BaseBackend):
     然后返回仿真器真正需要的指令字节流。
     """
     self._set_metadata(metadata)
+    # tinyasm 与 tinybin 由同一个 C++ pass 生成， 避免二者指令序列不一致
     del assembly
     return metadata.pop("tinygpu_binary")
+
+  def add_stages(self, stages, options):
+    """
+     注册这个 backend 的顺序编译阶段。
+        这里有个很关键的细节：
+        - Triton 的 `ASTSource` 是从 `ttir` 开始接后端的
+        - 所以第一阶段通常就应该叫 `ttir`
+
+        当前最小流水线是：
+        - `ttir`.    ：保留 Triton 生成的 TTIR
+        - `ttgir`.   ：保留 Triton 生成的 TTGIR
+        - `tinygpuir`：中间形态
+        - `tinyasm`  ：输出占位的 TinyGPU 汇编
+        - `tinybin`  ：输出占位的 TinyGPU 二进制
+    """
+    stages["ttir"]      = self.make_ttir
+    stages["ttgir"]     = lambda mod, metadata : self.make_ttgir(mod, metadata, options)
+    stages["tinygpuir"] = self.make_tinygpuir
+    stages["tinyasm"]   = self.make_tinyasm
+    stages["tinybin"]   = self.make_tinybin
+
+  def hash(self) -> str:
+    # 返回backend 身份字符串， 参与Triton的缓存key。
+    return f"tinygpu-{self.target.arch}-{self.target.warp_size}"
 
 
 
