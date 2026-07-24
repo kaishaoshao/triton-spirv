@@ -2,7 +2,7 @@
 //
 // 该checkpoint 验证正式后端层次
 // TTIR -> TTGIR -> TinyGPU pass -> tinyasm/tinybin
-// 当前只接受空TTGIR kernel， 并输出RET。下一阶段在此处实现TTGIR memory op
+// 阶段3: 支持out + 常量偏移后的单个i8 store
 
 #include "TritonTinyGPU/Transforms/Passes.h"
 #include "TritonTinyGPUToISA/TinyGPUEmitter.h"
@@ -43,6 +43,19 @@ static std::optional<uint8_t> getTruncatedI8Constant(Value value) {
   return static_cast<uint8_t>(valueAttr.getInt());
 }
 
+// 读取addptr偏移使用的整型常量
+// 阶段3只接受8-bit非负偏移，这样可以直接映射到TinyGPU的CONST指令
+static std::optional<uint8_t> getI8IntegerConstant(Value value) {
+  Operation *constant = value.getDefiningOp();
+  if (!constant || constant->getName().getStringRef() != "arith.constant")
+    return std::nullopt;
+
+  auto valueAttr = constant->getAttrOfType<mlir::IntegerAttr>("value");
+  if (!valueAttr || valueAttr.getInt() < 0 || !valueAttr.getValue().isIntN(8))
+    return std::nullopt;
+  return static_cast<uint8_t>(valueAttr.getInt());
+}
+
 class LowerTTGIRToTinyGPUPass
     : public mlir::PassWrapper<LowerTTGIRToTinyGPUPass, OperationPass<ModuleOp>> {
   public:
@@ -52,6 +65,8 @@ class LowerTTGIRToTinyGPUPass
       ModuleOp module = getOperation();
       TinyGPUEmitter emitter;
       llvm::DenseMap<Value, uint8_t> valueRegisters;
+      llvm::DenseMap<Value, uint8_t> addressRegisters;
+
       // TTIR -> TTGIR 的通用pass 会写入 ttg.num-warps. 以此拒绝错误的把
       // 原始 TTIR送入本pass， 保证TinyGPU lowering的输入层级固定
       if (!module->hasAttr("ttg.num-warps")) {
@@ -77,22 +92,44 @@ class LowerTTGIRToTinyGPUPass
 
               const auto constant =
                   getTruncatedI8Constant(operation.getResult(0));
-              if (!constant || !valueRegisters.empty()) {
-                operation.emitError("TinyGPU only supports one i8 constant for "
-                                    "the store-constant demo");
+              if (!constant || valueRegisters.count(operation.getResult(0))) {
+                operation.emitError("TinyGPU expects an i8 constant value");
                 signalPassFailure();
                 return;
               }
-              // R0 是第一个Kernel指针参数；
-              // 阶段2 唯一临时值固定使用R1
-              emitter.emitConstant(/*rd=*/1, *constant);
-              valueRegisters[operation.getResult(0)] = 1;
+              // R0是基地址；R1开始保存待写入的标量值。
+              const uint8_t valueRegister = 1 + valueRegisters.size();
+              emitter.emitConstant(valueRegister, *constant);
+              valueRegisters[operation.getResult(0)] = valueRegister;
+              continue;
+            }
+
+            if (operation.getName().getStringRef() == "tt.addptr") {
+              if (operation.getNumOperands() != 2 ||
+                  operation.getNumResults() != 1) {
+                operation.emitError("TinyGPU addptr expects one pointer and one offset");
+                signalPassFailure();
+                return;
+              }
+
+              auto base = dyn_cast<BlockArgument>(operation.getOperand(0));
+              const auto offset = getI8IntegerConstant(operation.getOperand(1));
+              if (!base || base.getArgNumber() != 0 || !offset) {
+                operation.emitError(
+                    "inyGPU stage 3 only supports out + i8 constant");
+                signalPassFailure();
+                return;
+              }
+
+              // 用R2保存偏移后的地址： R2 = R0 + offset
+              emitter.emitConstant(/*rd=*/2, *offset);
+              emitter.emitAdd(/*rd=*/2, /*lhs=*/0, /*rhs=*/2);
+              addressRegisters[operation.getResult(0)] = 2;
               continue;
             }
 
             if (operation.getName().getStringRef() == "tt.store") {
-              // 仅支持 “tt.store %arg0, %constant” : 无mask、两个operand,且
-              // 指针必须是第一个函数参数。
+              // 仅支持 `tt.store %pointer, %constant`：无 mask、两个 operand。
               if (operation.getNumOperands() != 2) {
                 operation.emitError(
                     "TinyGPU store-constant does not support masks");
@@ -103,14 +140,26 @@ class LowerTTGIRToTinyGPUPass
               auto pointer =
                   dyn_cast<mlir::BlockArgument>(operation.getOperand(0));
               const auto value = valueRegisters.find(operation.getOperand(1));
-              if (!pointer || pointer.getArgNumber() != 0 ||
-                  value == valueRegisters.end()) {
-              operation.emitError("TinyGPU only supports tt.store of the i8 "
-                                  "constant to the first pointer argument");
+              uint8_t address = 0;
+
+              if(pointer && pointer.getArgNumber() == 0)
+                address = 0;
+              else if (auto addressIt =
+                           addressRegisters.find(operation.getOperand(0));
+                       addressIt != addressRegisters.end())
+                address = addressIt->second;
+              else {
+                operation.emitError("TinyGPU store expects out or out + constant");
+                signalPassFailure();
+                return;
+              }
+
+              if (value == valueRegisters.end()) {
+              operation.emitError("TinyGPU store expects an i8 constant value");
               signalPassFailure();
               return;
               }
-              emitter.emitStore(/* address */ 0, value->second);
+              emitter.emitStore(address, value->second);
               continue;
             }
 
@@ -118,8 +167,8 @@ class LowerTTGIRToTinyGPUPass
               emitter.emitReturn();
               continue;
             }
-            operation.emitError(
-                  "TinyGPU TTGIR checkpoint only supports an empty kernel");
+            operation.emitError("TinyGPU stage 3 supports constants, addptr, "
+                              "store and return only");
             signalPassFailure();
             return;
 

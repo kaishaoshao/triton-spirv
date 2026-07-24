@@ -32,6 +32,17 @@ void TinyGPUEmitter::emitStore(uint8_t address, uint8_t value) {
   });
 }
 
+void TinyGPUEmitter::emitAdd(uint8_t rd, uint8_t lhs, uint8_t rhs) {
+  // ADD 格式： opcode=0011、rd[11:8] 、lhs[7:4]、rhs[3:0]
+  const uint16_t word =
+      0x3000 | ((rd & 0xF) << 8) | ((lhs & 0xF) << 4) | ((rhs & 0xF));
+  instructions.push_back({
+      word, "ADD " + reg(rd) + ", " +
+                reg(lhs) + ", " + reg(rhs)
+      });
+
+}
+
 std::string TinyGPUEmitter::assembly() const {
   std::string result;
   for (const EncodedInstruction &instruction : instructions)
