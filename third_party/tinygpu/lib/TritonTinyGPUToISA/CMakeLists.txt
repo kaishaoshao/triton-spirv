@@ -3,6 +3,7 @@ add_triton_library(TritonTinyGPUToISA
   TinyGPUEmitter.cpp
 
   LINK_LIBS PUBLIC
+  TritonTinyGPUIR
   TritonIR
   MLIRIR
   MLIRPass

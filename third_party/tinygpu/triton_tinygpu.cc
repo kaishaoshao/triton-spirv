@@ -3,10 +3,14 @@
 // Triton 的 python/src/main.cc 会调用：
 //   init_triton_tinygpu(m.def_submodule("tinygpu"));
 //
-// 第一阶段只验证原生后端接入是否正确，不在这里实现 TTIR lowering。
-// 真正的 lowering pass 会在第二阶段单独放到 lib/Conversion 中。
+// 具体 lowering 位于 lib/Conversion 和 lib/TritonTinyGPUToISA；
+// 这个文件只负责把 pass 注册给 Python，结构与 Triton 的 NVIDIA 后端保持一致。
 
-#include "TritonTinyGPU/Transforms/Passes.h"
+#include "TritonTinyGPUToISA/Passes.h"
+#include "Dialect/TinyGPU/IR/TinyGPU.h"
+#include "include/TritonTinyGPUToISA/TinyGPUEmitter.h"
+#include "mlir/IR/DialectRegistry.h"
+#include "mlir/IR/MLIRContext.h"
 
 #include <pybind11/pybind11.h>
 #include <mlir/Pass/PassManager.h>
@@ -18,13 +22,19 @@ void init_triton_tinygpu(py::module &&m) {
   auto passes = m.def_submodule("passes");
   auto ttgpuir = passes.def_submodule("ttgpuir");
 
-  ttgpuir.def("add_to_tinygpu", [](mlir::PassManager &pm) {
-    // python 只把 pass 加入 pass manager，真正的TTGIR lowering 保持独立
-    // C++文件中，便于后续继续添加 instructions selection 和 寄存器分配。
+  ttgpuir.def("add_lower_ttgir_to_tinygpuir", [](mlir::PassManager &pm) {
+    // 负责 TTGIR -> tinygpu.*，不直接发射 ISA。
+    pm.addPass(mlir::triton::tinygpu::createLowerTTGIRToTinyGPUIRPass());
+  });
+
+  ttgpuir.def("add_lower_tinygpuir_to_isa", [](mlir::PassManager &pm) {
+    //  pass 只消费 tinygpu.* 方言并生成 ISA metadata。
     pm.addPass(mlir::triton::tinygpu::createLowerTTGIRToTinyGPUPass());
   });
 
   ttgpuir.def("get_outputs", [](mlir::ModuleOp module) {
+    // Triton 的 ir.module Python binding 目前只提供 get_int_attr()；
+    // StringAttr 由 TinyGPU 自己读取，避免为了后端私有产物修改 Triton 核心 API。
     auto assembly = module->getAttrOfType<mlir::StringAttr>("tinygpu.asm");
     auto binaryHex =
         module->getAttrOfType<mlir::StringAttr>("tinygpu.binary_hex");
@@ -35,6 +45,12 @@ void init_triton_tinygpu(py::module &&m) {
     return py::make_tuple(assembly.getValue().str(), binaryHex.getValue().str());
   });
 
+  m.def("load_dialects", [](mlir::MLIRContext &context) {
+    mlir::DialectRegistry registry;
+    registry.insert<mlir::triton::tinygpu::TinyGPUDialect>();
+    context.appendDialectRegistry(registry);
+    context.loadAllAvailableDialects();
+  });
 
 }
 

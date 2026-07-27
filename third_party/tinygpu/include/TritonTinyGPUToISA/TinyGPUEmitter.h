@@ -17,9 +17,6 @@ public:
   void emitStore(uint8_t address, uint8_t value);
   void emitAdd(uint8_t rd, uint8_t lhs, uint8_t rhs);
 
-
-  
-
   std::string assembly() const;
   std::string binaryHex() const;
 

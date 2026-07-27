@@ -3,9 +3,8 @@ Triton 的 TinyGPU compile-only 后端。
 
 这份代码的定位是“教学骨架”，不是完整后端。
 它主要用来说明三件事：
-1. Triton 的 backend 接口应该怎么实现
-2. TinyGPU 相关 lowering 以后应该接在哪一层
-3. 第一版怎样尽量做小，便于调试和验证
+验证 TTIR -> TTGIR -> TinyGPU dialect -> TinyGPU ISA 的两段 lowering；
+向量和 memory 扩展留到后续阶段。
 
 """
 from __future__ import annotations
@@ -108,12 +107,13 @@ class TinyGPUBackend(BaseBackend):
     """
     return {}
 
-  def load_dialects(self, ctx):
+  def load_dialects(self, context):
     """
     如果后端需要额外 MLIR dialect，就在这里加载。
     当前最小版本只复用 Triton 已经加载好的核心 dialect。
     """
-    del ctx
+    # 阶段 4 注册 tinygpu.*，让 Python 创建的 MLIRContext 能识别方言。
+    tinygpu.load_dialects(context)
 
   @staticmethod
   def make_ttir(mod, metadata):
@@ -152,8 +152,8 @@ class TinyGPUBackend(BaseBackend):
     del metadata
     pm = ir.pass_manager(mod.context)
     # 该绑定由 triton_tinygpu.cc 注册，最终会创建C++的
-    # LowerTTGIRToTinyGPUPass. 此处输入必须已经是TTGIR
-    tinygpu.passes.ttgpuir.add_to_tinygpu(pm)
+    # 第一阶段只生成 tinygpu.* 方言，便于单独查看 TinyGPU IR。
+    tinygpu.passes.ttgpuir.add_lower_ttgir_to_tinygpuir(pm)
     pm.run(mod)
     return mod
 
@@ -179,6 +179,10 @@ class TinyGPUBackend(BaseBackend):
     在这里读取 TTIR，然后一步步翻译成 TinyGPU 指令。
     """
     self._set_metadata(metadata)
+    pm = ir.pass_manager(mod.context)
+    # 消费tinygpu.* 方言并生成tinyasm/tinybin metadate
+    tinygpu.passes.ttgpuir.add_lower_tinygpuir_to_isa(pm)
+    pm.run(mod)
     # C++ pass 把文本产物写入module attribute, Python stage只负责取出并
     # 交给 Triton 缓存，不在这里重新解析或生成指令
     # ir.module 没有暴露get_str_attr(); 该函数只绑定普通的 ir.operation。
