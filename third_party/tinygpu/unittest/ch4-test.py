@@ -37,6 +37,8 @@ def main():
         "RET\n"
     )
     assert kernel.asm["tinybin"] == bytes.fromhex("9201320291098021f000")
+    print(kernel.asm["ttir"])
+    print(kernel.asm["ttgir"])
     print(tinygpuir)
     print(kernel.asm["tinyasm"], end="")
     print(kernel.asm["tinybin"].hex())

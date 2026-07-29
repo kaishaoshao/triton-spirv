@@ -37,7 +37,13 @@ class TinyGPUOptions:
   num_ctas:         int = 1
   num_stages:       int = 1
   threads_per_warp: int = 4
-  debug:      bool = False
+  debug:           bool = False
+  # Triton 前端在整数加减乘除时会读取这个选项，决定是否插入溢出检查。
+  # TinyGPU 第一版不实现额外的溢出处理，但必须提供该字段以兼容前端接口。
+  # Triton 前端在整数加减乘除时会读取这个选项，决定是否插入溢出检查。
+  # 当前 TinyGPU 只支持 8-bit 标量算术，暂时关闭检查，避免前端生成
+  # arith.extsi/cmpi/andi 等 Ch5 尚未实现的辅助操作。
+  sanitize_overflow: bool = False
 
   """Triton 要求后端选项能生成稳定的 hash。"""
   def hash(self) -> str:
