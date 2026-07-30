@@ -12,7 +12,7 @@ namespace mlir::triton::tinygpu {
 std::unique_ptr<OperationPass<ModuleOp>> createLowerTTGIRToTinyGPUIRPass();
 
 // 将tinygpu.*方言降为 TinyGP汇编/二进制matadata
-std::unique_ptr<OperationPass<ModuleOp>> createLowerTTGIRToTinyGPUPass();
+std::unique_ptr<OperationPass<ModuleOp>> createLowerTinyGPUIRToISAPass();
 
 } // namespace mlir::triton::tinygpu
 

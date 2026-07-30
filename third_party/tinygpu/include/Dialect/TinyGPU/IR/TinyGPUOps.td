@@ -83,4 +83,13 @@ def TinyGPU_SharedStoreOp : TinyGPU_Op<"shared_store"> {
 // 确保读取到其他线程已经写入的数据。
 def TinyGPU_BinaryOp : TinyGPU_Op<"barrier">;
 
+// 当前执行线程的 lane id。
+//
+// 这不是一条需要编码的 TinyGPU ISA 指令，而是一个“硬件寄存器引用”语义：
+// ISA lowering 会把它固定映射到仿真器预置的 R15（threadIdx）。
+// 单独建模这个语义操作，可以让上层 lowering 区分“普通计算结果”和“硬件值”。
+def TinyGPU_ThreadIdOp : TinyGPU_Op<"thread_id"> {
+  let results = (outs I8:$result);
+}
+
 #endif // TRITON_TINYGPU_OPS

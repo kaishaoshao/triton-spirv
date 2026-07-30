@@ -53,6 +53,9 @@ class LowerTTGIRToTinyGPUPass
         for (Block &block : function.getBody()) {
           std::array<bool, 16> usedRegisters{};
           usedRegisters[0] = true;
+          // R15 是 TinyGPU 仿真器预置的 threadIdx，Ch6 将它作为 lane id 使用。
+          // 必须从通用寄存器分配池中排除，否则普通 SSA 值可能覆盖硬件值。
+          usedRegisters[15] = true;
 
           auto claimRegister = [&](uint8_t reg) {
             usedRegisters[reg & 0xF] = true;
@@ -84,6 +87,13 @@ class LowerTTGIRToTinyGPUPass
               }
               claimRegister(0);
               registers[operation.getResult(0)] = 0;
+              continue;
+            }
+
+            if (name == "tinygpu.thread_id") {
+              // thread_id 不发射机器指令；它只是把语义值绑定到硬件寄存器 R15。
+              claimRegister(15);
+              registers[operation.getResult(0)] = 15;
               continue;
             }
 
@@ -255,7 +265,7 @@ class LowerTTGIRToTinyGPUPass
 
 } // namespace
 
-std::unique_ptr<OperationPass<ModuleOp>> createLowerTTGIRToTinyGPUPass() {
+std::unique_ptr<OperationPass<ModuleOp>> createLowerTinyGPUIRToISAPass() {
   return std::make_unique<LowerTTGIRToTinyGPUPass>();
 }
 

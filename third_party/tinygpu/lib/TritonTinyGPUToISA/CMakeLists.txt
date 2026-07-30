@@ -1,5 +1,5 @@
 add_triton_library(TritonTinyGPUToISA
-  TTGIRToTinyGPU.cpp
+  TinyGPUIRToISA.cpp
   TinyGPUEmitter.cpp
 
   LINK_LIBS PUBLIC

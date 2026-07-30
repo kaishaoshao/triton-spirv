@@ -3,7 +3,7 @@
 // Triton 的 python/src/main.cc 会调用：
 //   init_triton_tinygpu(m.def_submodule("tinygpu"));
 //
-// 具体 lowering 位于 lib/Conversion 和 lib/TritonTinyGPUToISA；
+// 具体 lowering 位于 lib/Conversion；这个文件只负责把 pass 注册给 Python，
 // 这个文件只负责把 pass 注册给 Python，结构与 Triton 的 NVIDIA 后端保持一致。
 
 #include "TritonTinyGPUToISA/Passes.h"
@@ -29,7 +29,7 @@ void init_triton_tinygpu(py::module &&m) {
 
   ttgpuir.def("add_lower_tinygpuir_to_isa", [](mlir::PassManager &pm) {
     //  pass 只消费 tinygpu.* 方言并生成 ISA metadata。
-    pm.addPass(mlir::triton::tinygpu::createLowerTTGIRToTinyGPUPass());
+    pm.addPass(mlir::triton::tinygpu::createLowerTinyGPUIRToISAPass());
   });
 
   ttgpuir.def("get_outputs", [](mlir::ModuleOp module) {

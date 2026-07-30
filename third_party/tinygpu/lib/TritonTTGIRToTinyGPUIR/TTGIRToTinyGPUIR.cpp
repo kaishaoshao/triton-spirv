@@ -45,6 +45,17 @@ static Operation *createBase(mlir::OpBuilder &builder, Location loc) {
   return builder.create(state);
 }
 
+// 创建当前线程 lane id 的硬件值。
+//
+// TinyGPU 仿真器会在每个线程的 R15 中预置 threadIdx，因此这里不生成
+// CONST 或其他算术指令，只在 TinyGPU IR 中留下一个有明确语义的 SSA 值。
+// 下一层 ISA lowering 再把 tinygpu.thread_id 映射为固定寄存器 R15。
+static Operation *createThreadId(OpBuilder &builder, Location loc) {
+  OperationState state(loc, ThreadIdOp::getOperationName());
+  state.addTypes(builder.getI8Type());
+  return builder.create(state);
+}
+
 static Operation *createConstant(OpBuilder &builder, Location loc,
                                  uint8_t value, llvm::StringRef role) {
   OperationState state(loc, ConstOp::getOperationName());
@@ -162,8 +173,15 @@ public:
         if(name == "arith.constant")
           continue;
 
-        if (name == "arith.trunci")
-        {
+        if (name == "arith.trunci") {
+          // 向量make_range的元素类型通常先从i32截断到i8。 Ch6中
+          // make_range 已经被表示成thread_id, 所以只需要传播同一个lane值
+          // 不要再要求它必须是 arith.constant
+          if (auto it = values.find(operation->getOperand(0));
+              it != values.end()) {
+            values[operation->getResult(0)] = it->second;
+            continue;
+          }
           auto value = getTruncatedConstant(operation->getResult(0));
           if (!value) {
             operation->emitError("TinyGPU dialect expects an i8 constant value");
@@ -174,6 +192,42 @@ public:
           Operation *converted = createConstant(builder, operation->getLoc(),
                                                 *value, StringRef("value"));
           values[operation->getResult(0)] = converted->getResult(0);
+          continue;
+        }
+
+        if (name == "tt.make_range") {
+          // Ch6 只支持 arange(0, 4)，它与 TinyGPU 的 4-lane 执行模型一一对应。
+          // 每个 lane 使用自己的 threadIdx 作为该向量元素，因此不需要真的
+          // 物化一个 tensor 或生成四份指令。
+          auto start = operation->getAttrOfType<IntegerAttr>("start");
+          auto end = operation->getAttrOfType<IntegerAttr>("end");
+          if (!start || !end || start.getInt() != 0 || end.getInt() != 4) {
+            operation->emitError(
+                "TinyGPU Ch6 only supports tt.make_range start=0, end=4");
+            signalPassFailure();
+            return;
+          }
+          Operation *threadId = createThreadId(builder, operation->getLoc());
+          values[operation->getResult(0)] = threadId->getResult(0);
+          continue;
+        }
+
+        if (name == "tt.splat") {
+          // tt.splat 把一个标量复制到所有lane。TinyGPU采用SPMD模型，
+          // 每个线程本来就会独立执行同一条指令，所以只需要标量SSA值。
+          if (operation->getNumOperands() != 1 ||
+              operation->getNumResults() != 1) {
+            operation->emitError("TinyGPU Ch6 expects a one-operand tt.splat");
+            signalPassFailure();
+            return;
+          }
+          auto value = getOrCreateValue(operation, operation->getOperand(0),
+                                        builder, values);
+          if (!value) {
+            signalPassFailure();
+            return;
+          }
+          values[operation->getResult(0)] = *value;
           continue;
         }
 
@@ -214,19 +268,41 @@ public:
         }
 
         if (name == "tt.addptr") {
-          auto baseArgument = dyn_cast<BlockArgument>(operation->getOperand(0));
-          auto offset = getConstant(operation->getOperand(1));
-          if (!baseArgument || baseArgument.getArgNumber() != 0 || !offset) {
-            operation->emitError(
-                "TinyGPU dialect stage 4 only supports out + constant");
+          // Ch4 的标量 addptr 和 Ch6 的向量 addptr 都在这里汇合：
+          // 上层的向量值已经被折叠为“当前 lane 的标量值”，因此只要解析
+          // 两个输入并创建一个 TinyGPU 标量地址即可。
+          if (operation->getNumOperands() != 2 ||
+              operation->getNumResults() != 1) {
+            operation->emitError("TinyGPU Ch6 expects a binary tt.addptr");
             signalPassFailure();
             return;
           }
-          Operation *offsetValue = createConstant(
-              builder, operation->getLoc(), *offset, StringRef("address"));
+
+          auto base = getOrCreateValue(operation, operation->getOperand(0),
+                                       builder, values);
+          std::optional<Value> offset;
+          Value offsetInput = operation->getOperand(1);
+
+          if (auto it = values.find(offsetInput); it != values.end()) {
+            // Ch6 的动态向量偏移已经是 thread_id，直接复用它。
+            offset = it->second;
+          } else if (auto constant = getConstant(offsetInput)) {
+            // 标量常量偏移仍然必须标记为 address，保留 Ch3/Ch4 的
+            // R2 优先寄存器约定，并避免把地址常量误当成普通数据常量。
+            Operation *offsetValue =
+                createConstant(builder, offsetInput.getDefiningOp()->getLoc(),
+                               *constant, StringRef("address"));
+            offset = offsetValue->getResult(0);
+            values[offsetInput] = *offset;
+          }
+
+          if (!base || !offset) {
+            signalPassFailure();
+            return;
+          }
+
           Operation *address = createAddPtr(builder, operation->getLoc(),
-                                            values[operation->getOperand(0)],
-                                            offsetValue->getResult(0));
+                                            *base, *offset);
           values[operation->getResult(0)] = address->getResult(0);
           continue;
         }

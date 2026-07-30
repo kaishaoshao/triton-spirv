@@ -1,3 +1,3 @@
 add_subdirectory(Dialect/TinyGPU/IR)
-add_subdirectory(Conversion/TritonToTinyGPU)
+add_subdirectory(TritonTTGIRToTinyGPUIR)
 add_subdirectory(TritonTinyGPUToISA)
