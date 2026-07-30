@@ -1,11 +1,6 @@
-"""
-Triton 的 TinyGPU compile-only 后端。
-
-这份代码的定位是“教学骨架”，不是完整后端。
-它主要用来说明三件事：
-验证 TTIR -> TTGIR -> TinyGPU dialect -> TinyGPU ISA 的两段 lowering；
-向量和 memory 扩展留到后续阶段。
-
+"""TinyGPU 的 Triton 编译后端。
+当前教程验证 TTIR -> TTGIR -> TinyGPU dialect -> TinyGPU ISA 的两段 lowering，
+并在 Ch7 支持无 mask 的 4-lane vector load/add/store。
 """
 from __future__ import annotations
 

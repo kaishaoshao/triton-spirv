@@ -1,19 +1,19 @@
 #include "Dialect/TinyGPU/IR/TinyGPU.h"
 #include "TritonTinyGPUToISA/Passes.h"
 
-#include "mlir/IR/OperationSupport.h"
-#include "triton/Dialect/Triton/IR/Dialect.h"
+#include <triton/Dialect/Triton/IR/Dialect.h>
 
-#include <mlir/IR/Diagnostics.h>
 #include <mlir/IR/Value.h>
-#include <llvm/ADT/StringRef.h>
+#include <mlir/IR/Diagnostics.h>
+#include <mlir/IR/Builders.h>
+#include <mlir/IR/BuiltinTypes.h>
+#include <mlir/IR/BuiltinAttributes.h>
+#include <mlir/IR/OperationSupport.h>
+#include <mlir/Pass/Pass.h>
 
 #include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/StringRef.h>
 #include <llvm/ADT/SmallVector.h>
-
-#include <mlir/IR/BuiltinAttributes.h>
-#include <mlir/IR/Builders.h>
-#include <mlir/Pass/Pass.h>
 
 namespace mlir::triton::tinygpu {
 
@@ -23,13 +23,27 @@ static std::optional<uint8_t> getConstant(Value value) {
   Operation *constant = value.getDefiningOp();
   if (!constant || constant->getName().getStringRef() != "arith.constant")
     return std::nullopt;
+  // 标量常量的形式：arith.constant 1 : i8。
   auto attr = constant->getAttrOfType<IntegerAttr>("value");
   // TinyGPU 的立即数按 8-bit 无符号值编码，允许范围是 0 到 255。
-  if (!attr || attr.getInt() < 0 || !attr.getValue().isIntN(8))
-    return std::nullopt;
-  return static_cast<uint8_t>(attr.getInt());
-}
+  if (attr) {
+    // TinyGPU的立即数按8-bit无符号编码，允许范围是0-255
+    if (attr.getInt() < 0 || !attr.getValue().isIntN(8))
+      return std::nullopt;
+    return static_cast<uint8_t>(attr.getInt());
+  }
 
+  // 向量常量的形式：arith.constant dense<1> : tensor<4xi8>。
+  // 这是 Triton 在 value + 1 中实际生成的 IR：常量已经被前端广播，
+  // 但 TinyGPU 每个 lane 只需要同一个标量立即数。
+  auto dense = constant->getAttrOfType<DenseIntElementsAttr>("value");
+  if (!dense || !dense.isSplat())
+    return std::nullopt;
+  APInt splatValue = dense.getSplatValue<APInt>();
+  if (splatValue.isNegative() || !splatValue.isIntN(8))
+    return std::nullopt;
+  return static_cast<uint8_t>(splatValue.getZExtValue());
+}
 
 static std::optional<uint8_t> getTruncatedConstant(Value value) {
   Operation *trunc = value.getDefiningOp();
@@ -38,6 +52,30 @@ static std::optional<uint8_t> getTruncatedConstant(Value value) {
   return getConstant(trunc->getOperand(0));
 }
 
+// 当前 TinyGPU lowering 只支持 4-lane 一维向量。
+//
+// TinyGPU IR 最终仍然使用一个标量 SSA 值表示“当前 lane 的元素”，但在
+// TTGIR -> TinyGPUIR 过程中不能因此丢掉向量语义。这个检查帮助我们区分：
+//
+//   tensor<4x...>  -> 当前 lane 的标量值
+//   scalar         -> 普通标量值
+//
+// 后续扩展通用 layout 时，会把这里的固定 4 替换为 layout 查询
+static bool isSupportedVectorType(Type type) {
+  auto tensorType = dyn_cast<RankedTensorType>(type);
+  return tensorType && tensorType.getRank() == 1 &&
+         tensorType.getDimSize(0) == 4;
+}
+
+static bool isVectorValue(Value value,
+                          llvm::DenseMap<Value, bool> &vectorValues) {
+  if (auto it = vectorValues.find(value); it != vectorValues.end())
+    return it->second;
+  return isSupportedVectorType(value.getType());
+}
+
+// 将当前唯一的 Triton 指针参数保留为 TinyGPU IR 中的参数引用。
+// 多参数 ABI 会在 Ch8 单独引入，本阶段只验证 R0 这一条参数路径。
 static Operation *createBase(mlir::OpBuilder &builder, Location loc) {
   OperationState state(loc, BaseOp::getOperationName());
   state.addTypes(builder.getI8Type());
@@ -86,6 +124,9 @@ static Operation *createAddPtr(OpBuilder &builder, Location loc, Value base,
   return builder.create(state);
 }
 
+// 创建全局内存 load。
+// 当前只接受无 mask 的 load，但它可以来自向量指针。由于 TinyGPU
+// 采用 SPMD 执行方式，每个 lane 最终只需要一条标量 LDR 指令。
 static Operation *createLoad(OpBuilder &builder, Location loc, Value address) {
   OperationState state(loc, "tinygpu.load");
   state.addOperands(address);
@@ -111,14 +152,15 @@ static Operation *createReturn(OpBuilder &builder, Location loc) {
 // 前面的 addptr 结果。对于尚未处理的 arith.constant，这里采用“按需
 // materialize”的方式创建 tinygpu.const。这样既能支持 `x + 1`，又不会
 // 为同一个 arith.constant 提前生成重复的 TinyGPU 常量。
-static std::optional<Value>
-getOrCreateValue(Operation *user, Value input, OpBuilder &builder,
+static std::optional<Value> getOrCreateValue(
+                 Operation *user, Value input, OpBuilder &builder,
                  llvm::DenseMap<Value, Value> &values) {
   if (auto it = values.find(input); it != values.end())
     return it->second;
   auto constant = getConstant(input);
   if (!constant) {
-    user->emitError("TinyGPU Ch5 expects a scalar value or an 8-bit constant");
+    user->emitError(
+        "TinyGPU expects a lowered scalar value or an 8-bit constant");
     return std::nullopt;
   }
   Operation *converted = createConstant(
@@ -145,14 +187,18 @@ public:
       Block &entry = function.getBody().front();
       OpBuilder entryBuilder(&entry, entry.begin());
       llvm::DenseMap<Value, Value> values;
+      // 记录 TTIR/TTGIR SSA 值是否代表 4-lane tensor。
+      // values 只记录 TinyGPU 的标量 SSA 映射，vectorValues 保留上层语义。
+      llvm::DenseMap<Value, bool> vectorValues;
+      // 当前lowering 只使用一个指针参数，多参数ABI由后续实现负责
       if (function.getNumArguments() > 1) {
         function.emitError(
-            "TinyGPU Ch5 expects zero arguments for an empty kernel or "
-            "one i8 pointer argument for a scalar kernel");
+          "TinyGPU lowering supports only one pointer argument");
         signalPassFailure();
         return;
       }
 
+      // BaseOp不发射机器指令，只表达唯一的kernel参数引用
       Operation *base = nullptr;
       if (function.getNumArguments() == 1) {
         base = createBase(entryBuilder, function.getLoc());
@@ -180,6 +226,8 @@ public:
           if (auto it = values.find(operation->getOperand(0));
               it != values.end()) {
             values[operation->getResult(0)] = it->second;
+            vectorValues[operation->getResult(0)] =
+                isVectorValue(operation->getOperand(0), vectorValues);
             continue;
           }
           auto value = getTruncatedConstant(operation->getResult(0));
@@ -192,6 +240,7 @@ public:
           Operation *converted = createConstant(builder, operation->getLoc(),
                                                 *value, StringRef("value"));
           values[operation->getResult(0)] = converted->getResult(0);
+          vectorValues[operation->getResult(0)] = false;
           continue;
         }
 
@@ -201,14 +250,17 @@ public:
           // 物化一个 tensor 或生成四份指令。
           auto start = operation->getAttrOfType<IntegerAttr>("start");
           auto end = operation->getAttrOfType<IntegerAttr>("end");
-          if (!start || !end || start.getInt() != 0 || end.getInt() != 4) {
+          if (!start || !end || start.getInt() != 0 || end.getInt() != 4 ||
+              !isSupportedVectorType(operation->getResult(0).getType())) {
             operation->emitError(
-                "TinyGPU Ch6 only supports tt.make_range start=0, end=4");
+                "TinyGPU only supports a tensor<4x...> make_range "
+                "with start=0 and end=4");
             signalPassFailure();
             return;
           }
           Operation *threadId = createThreadId(builder, operation->getLoc());
           values[operation->getResult(0)] = threadId->getResult(0);
+          vectorValues[operation->getResult(0)] = true;
           continue;
         }
 
@@ -216,8 +268,10 @@ public:
           // tt.splat 把一个标量复制到所有lane。TinyGPU采用SPMD模型，
           // 每个线程本来就会独立执行同一条指令，所以只需要标量SSA值。
           if (operation->getNumOperands() != 1 ||
-              operation->getNumResults() != 1) {
-            operation->emitError("TinyGPU Ch6 expects a one-operand tt.splat");
+              operation->getNumResults() != 1  ||
+              !isSupportedVectorType(operation->getResult(0).getType())) {
+            operation->emitError(
+                "TinyGPU expects a one-operand 4-lane tt.splat");
             signalPassFailure();
             return;
           }
@@ -228,6 +282,7 @@ public:
             return;
           }
           values[operation->getResult(0)] = *value;
+          vectorValues[operation->getResult(0)] = true;
           continue;
         }
 
@@ -237,7 +292,7 @@ public:
           if (operation->getNumOperands() != 2 ||
               operation->getNumResults() != 1) {
             operation->emitError(
-                "TinyGPU Ch5 arithmetic expects two scalar operands");
+                "TinyGPU arithmetic expects two lowered scalar operands");
             signalPassFailure();
             return;
           }
@@ -252,6 +307,23 @@ public:
             return;
           }
 
+          // 当前允许两种形式：scalar + scalar，以及 4-lane vector 与
+          // scalar/vector 的逐 lane 加法。结果的 tensor 形状必须与输入语义
+          // 一致，不能把一个未广播的向量误当成普通标量。
+          bool lhsVector =
+              isVectorValue(operation->getOperand(0), vectorValues);
+          bool rhsVector =
+              isVectorValue(operation->getOperand(1), vectorValues);
+          bool resultVector =
+              isSupportedVectorType(operation->getResult(0).getType());
+
+          if (resultVector != (lhsVector || rhsVector)) {
+            operation->emitError(
+                "TinyGPU arithmetic vector shape does not match operands");
+            signalPassFailure();
+            return;
+          }
+
           StringRef tinygpuName = "tinygpu.add";
           if (name == "arith.subi")
             tinygpuName = "tinygpu.sub";
@@ -262,18 +334,18 @@ public:
 
           Operation *converted = createBinary(builder, operation->getLoc(),
                                               tinygpuName, *lhs, *rhs);
-
           values[operation->getResult(0)] = converted->getResult(0);
+          vectorValues[operation->getResult(0)] = resultVector;
           continue;
         }
 
         if (name == "tt.addptr") {
-          // Ch4 的标量 addptr 和 Ch6 的向量 addptr 都在这里汇合：
-          // 上层的向量值已经被折叠为“当前 lane 的标量值”，因此只要解析
-          // 两个输入并创建一个 TinyGPU 标量地址即可。
+          // 标量 addptr 和向量 addptr
+          // 都在这里汇合。上层向量值已经被折叠为当前 lane 的标量值，
+          // 因此 TinyGPU IR 仍然只需要一个标量地址。
           if (operation->getNumOperands() != 2 ||
               operation->getNumResults() != 1) {
-            operation->emitError("TinyGPU Ch6 expects a binary tt.addptr");
+            operation->emitError("TinyGPU expects a binary tt.addptr");
             signalPassFailure();
             return;
           }
@@ -301,18 +373,32 @@ public:
             return;
           }
 
+          bool baseVector =
+              isVectorValue(operation->getOperand(0), vectorValues);
+          bool offsetVector =
+              isVectorValue(operation->getOperand(1), vectorValues);
+          bool resultVector =
+              isSupportedVectorType(operation->getResult(0).getType());
+          if (resultVector != (baseVector || offsetVector)) {
+            operation->emitError(
+                "TinyGPU addptr vector shape does not match operands");
+            signalPassFailure();
+            return;
+          }
+
           Operation *address = createAddPtr(builder, operation->getLoc(),
                                             *base, *offset);
           values[operation->getResult(0)] = address->getResult(0);
+          vectorValues[operation->getResult(0)] = resultVector;
           continue;
         }
 
         if (name == "tt.load") {
-          // mask、边界检查和 cache policy 都留到后续阶段；Ch5 只接受
-          // 一个标量地址操作数。
+          // mask、边界检查和 cache policy 都留到后续阶段。向量
+          // load 经过当前 lane 映射后，同样表现为一个标量地址操作数。
           if (operation->getNumOperands() != 1) {
             operation->emitError(
-                "TinyGPU Ch5 only supports an unmasked scalar tt.load");
+                "TinyGPU only supports an unmasked tt.load");
             signalPassFailure();
             return;
           }
@@ -322,16 +408,29 @@ public:
             signalPassFailure();
             return;
           }
+
+          bool addressVector =
+              isVectorValue(operation->getOperand(0), vectorValues);
+          bool resultVector =
+              isSupportedVectorType(operation->getResult(0).getType());
+          if (addressVector != resultVector) {
+            operation->emitError(
+                "TinyGPU load result must match address vector shape");
+            signalPassFailure();
+            return;
+          }
+
           Operation *converted =
               createLoad(builder, operation->getLoc(), *address);
           values[operation->getResult(0)] = converted->getResult(0);
+          vectorValues[operation->getResult(0)] = resultVector;
           continue;
         }
 
         if (name == "tt.store") {
           if (operation->getNumOperands() != 2 ) {
             operation->emitError(
-                "TinyGPU Ch5 only supports an unmasked scalar tt.store");
+                "TinyGPU only supports an unmasked tt.store");
             signalPassFailure();
             return;
           }
@@ -344,6 +443,19 @@ public:
             signalPassFailure();
             return;
           }
+
+          bool addressVector =
+              isVectorValue(operation->getOperand(0), vectorValues);
+          bool valueVector =
+              isVectorValue(operation->getOperand(1), vectorValues);
+          if (addressVector != valueVector) {
+            operation->emitError(
+                "TinyGPU store address and value must have the same "
+                "vector shape");
+            signalPassFailure();
+            return;
+          }
+
           createStore(builder, operation->getLoc(), *address, *value);
           continue;
         }
@@ -353,7 +465,7 @@ public:
           continue;
         }
 
-        operation->emitError("TinyGPU Ch5 does not support this TTIR/TTGIR op");
+        operation->emitError("TinyGPU lowering does not support this op");
         signalPassFailure();
         return;
       }

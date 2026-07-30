@@ -1,6 +1,6 @@
 // tinygpu.* 方言 -> TinyGPU ISA。
-// 阶段 4 只负责消费方言，不再解析 TTGIR 的 arith/tt 操作。
-// 阶段 5 覆盖完整的标量指令选择；这里仍然不直接解析 Triton TTIR/TTGIR。
+// 在标量指令选择上增加 vector load/add/store 数据流；
+// 多参数 ABI 留到 Ch8，这里仍然不直接解析 Triton TTIR/TTGIR。
 
 
 #include "Dialect/TinyGPU/IR/TinyGPU.h"
@@ -53,7 +53,7 @@ class LowerTTGIRToTinyGPUPass
         for (Block &block : function.getBody()) {
           std::array<bool, 16> usedRegisters{};
           usedRegisters[0] = true;
-          // R15 是 TinyGPU 仿真器预置的 threadIdx，Ch6 将它作为 lane id 使用。
+          // R15 是 TinyGPU 仿真器预置的 threadIdx，当前 lowering 将它作为 lane id 使用。
           // 必须从通用寄存器分配池中排除，否则普通 SSA 值可能覆盖硬件值。
           usedRegisters[15] = true;
 
@@ -81,7 +81,7 @@ class LowerTTGIRToTinyGPUPass
             if (name == "tinygpu.base") {
               auto index = operation.getAttrOfType<IntegerAttr>("arg_index");
               if (!index || index.getInt() != 0) {
-                operation.emitError("TinyGPU stage 4 only supports base argument 0");
+                operation.emitError("TinyGPU lowering only supports base argument 0");
                 signalPassFailure();
                 return;
               }
@@ -107,7 +107,8 @@ class LowerTTGIRToTinyGPUPass
                 signalPassFailure();
                 return;
               }
-              // 保留 Ch4 的 R1/R2 约定；同类常量重复出现时再分配新寄存器。
+              // 当前单参数 ABI 沿用 R2 作为地址临时寄存器；虚拟寄存器和
+              // 多参数 ABI 由后续 lowering 负责。
               uint8_t preferred = role.getValue() == "address" ? 2 : 1;
               uint8_t reg = preferred;
               if (usedRegisters[reg]) {
