@@ -13,7 +13,7 @@ class TinyGPU_Op<string mnemonic, list<Trait> traits = []> :
   Op<TinyGPU_Dialect, mnemonic, traits>;
 
 // Kernel 指针参数引用。
-// Ch7 只使用 arg_index=0；多参数 arg_index=1/2 的 ABI 在 Ch8 引入。
+// arg_index 表示参数序号，具体寄存器绑定由目标 ABI 决定。。
 def TinyGPU_BaseOp : TinyGPU_Op<"base"> {
   let arguments = (ins I32Attr:$arg_index);
   let results = (outs I8:$result);

@@ -1,6 +1,6 @@
 // tinygpu.* 方言 -> TinyGPU ISA。
-// 在标量指令选择上增加 vector load/add/store 数据流；
-// 多参数 ABI 留到 Ch8，这里仍然不直接解析 Triton TTIR/TTGIR。
+// 这一层负责把 TinyGPU dialect 的语义值绑定到 TinyGPU 的物理寄存器，
+// 再调用 emitter 生成 16-bit 指令编码。
 
 
 #include "Dialect/TinyGPU/IR/TinyGPU.h"
@@ -53,13 +53,23 @@ class LowerTTGIRToTinyGPUPass
         for (Block &block : function.getBody()) {
           std::array<bool, 16> usedRegisters{};
           usedRegisters[0] = true;
+          // 保留寄存器由 ABI 或硬件定义，不能分配给普通的临时 SSA 值。
+          std::array<bool, 16> reservedRegisters{};
+          reservedRegisters[0] = true; //
           // R15 是 TinyGPU 仿真器预置的 threadIdx，当前 lowering 将它作为 lane id 使用。
           // 必须从通用寄存器分配池中排除，否则普通 SSA 值可能覆盖硬件值。
           usedRegisters[15] = true;
+          reservedRegisters[15] = true;
 
           auto claimRegister = [&](uint8_t reg) {
             usedRegisters[reg & 0xF] = true;
           };
+
+          auto reserveRegister = [&](uint8_t reg) {
+            usedRegisters[reg & 0xF] = true;
+            reservedRegisters[reg & 0xF] = true;
+          };
+
           auto allocateRegister = [&]() -> std::optional<uint8_t> {
             for (uint8_t reg = 1; reg < 16; ++reg) {
               if (!usedRegisters[reg]) {
@@ -80,13 +90,17 @@ class LowerTTGIRToTinyGPUPass
 
             if (name == "tinygpu.base") {
               auto index = operation.getAttrOfType<IntegerAttr>("arg_index");
-              if (!index || index.getInt() != 0) {
-                operation.emitError("TinyGPU lowering only supports base argument 0");
+              if (!index || index.getInt() < 0 || index.getInt() > 2) {
+                operation.emitError(
+                    "TinyGPU base argument index must be in the range [0, 2]");
                 signalPassFailure();
                 return;
               }
-              claimRegister(0);
-              registers[operation.getResult(0)] = 0;
+              // ABI: 第0、1、2个kernel指针参数固定使用R0、R1、R2
+              // 保留寄存器不会进入临时寄存器分配池，避免地址被覆盖
+              uint8_t reg = static_cast<uint8_t>(index.getInt());
+              reserveRegister(reg);
+              registers[operation.getResult(0)] = reg;
               continue;
             }
 
@@ -107,8 +121,8 @@ class LowerTTGIRToTinyGPUPass
                 signalPassFailure();
                 return;
               }
-              // 当前单参数 ABI 沿用 R2 作为地址临时寄存器；虚拟寄存器和
-              // 多参数 ABI 由后续 lowering 负责。
+              // 对地址和值保留稳定的首选寄存器；如果 ABI 已经占用首选寄存器，
+              // 就从通用临时寄存器池分配，避免覆盖 kernel 参数。
               uint8_t preferred = role.getValue() == "address" ? 2 : 1;
               uint8_t reg = preferred;
               if (usedRegisters[reg]) {
@@ -134,9 +148,22 @@ class LowerTTGIRToTinyGPUPass
                 signalPassFailure();
                 return;
               }
-              emitter.emitAdd(/*rd=*/2, *base, *offset);
-              claimRegister(2);
-              registers[operation.getResult(0)] = 2;
+              // 单参数时保留历史上的 R2 地址临时寄存器；多参数时 R0/R1/R2
+              // 都是 ABI 参数，地址结果必须改用通用临时寄存器。
+              std::optional<uint8_t> result;
+              if (!reservedRegisters[2]) {
+                claimRegister(2);
+                result = 2;
+              } else {
+                result = allocateRegister();
+              }
+              if (!result) {
+                operation.emitError("TinyGPU addptr lowering ran out of registers");
+                signalPassFailure();
+                return;
+              }
+              emitter.emitAdd(*result, *base, *offset);
+              registers[operation.getResult(0)] = *result;
               continue;
             }
 
@@ -145,7 +172,7 @@ class LowerTTGIRToTinyGPUPass
               auto lhs =
                   getRegister(operation, operation.getOperand(0), registers);
               auto rhs =
-                  getRegister(operation, operation.getOperand(0), registers);
+                  getRegister(operation, operation.getOperand(1), registers);
               auto result = allocateRegister();
               if (!lhs || !rhs || !result) {
                 operation.emitError("TinyGPU arithmetic lowering failed");

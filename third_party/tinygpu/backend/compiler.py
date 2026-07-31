@@ -1,6 +1,6 @@
 """TinyGPU 的 Triton 编译后端。
 当前教程验证 TTIR -> TTGIR -> TinyGPU dialect -> TinyGPU ISA 的两段 lowering，
-并在 Ch7 支持无 mask 的 4-lane vector load/add/store。
+并支持无 mask 的 4-lane vector load/add/store 和三参数 compile-only ABI。
 """
 from __future__ import annotations
 

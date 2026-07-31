@@ -14,6 +14,7 @@
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/ADT/SmallPtrSet.h>
 
 namespace mlir::triton::tinygpu {
 
@@ -74,12 +75,13 @@ static bool isVectorValue(Value value,
   return isSupportedVectorType(value.getType());
 }
 
-// 将当前唯一的 Triton 指针参数保留为 TinyGPU IR 中的参数引用。
-// 多参数 ABI 会在 Ch8 单独引入，本阶段只验证 R0 这一条参数路径。
-static Operation *createBase(mlir::OpBuilder &builder, Location loc) {
+// 将一个 Triton 指针参数保留为 TinyGPU IR 中的参数引用。
+// arg_index 只记录参数序号，具体的物理寄存器绑定由 ISA lowering 的 ABI 决定。
+static Operation *createBase(mlir::OpBuilder &builder, Location loc,
+                             unsigned argIndex) {
   OperationState state(loc, BaseOp::getOperationName());
   state.addTypes(builder.getI8Type());
-  state.addAttribute("arg_index", builder.getI32IntegerAttr(0));
+  state.addAttribute("arg_index", builder.getI32IntegerAttr(argIndex));
   return builder.create(state);
 }
 
@@ -190,24 +192,29 @@ public:
       // 记录 TTIR/TTGIR SSA 值是否代表 4-lane tensor。
       // values 只记录 TinyGPU 的标量 SSA 映射，vectorValues 保留上层语义。
       llvm::DenseMap<Value, bool> vectorValues;
-      // 当前lowering 只使用一个指针参数，多参数ABI由后续实现负责
-      if (function.getNumArguments() > 1) {
+      // 当前 TinyGPU ABI 最多接收三个指针参数，分别用于输出、输入和输入。
+      // 参数数量限制属于这个教学后端的 ABI 约束，不是 MLIR 本身的限制。
+      if (function.getNumArguments() > 3) {
         function.emitError(
-          "TinyGPU lowering supports only one pointer argument");
+          "TinyGPU lowering supports at most three pointer arguments");
         signalPassFailure();
         return;
       }
 
-      // BaseOp不发射机器指令，只表达唯一的kernel参数引用
-      Operation *base = nullptr;
-      if (function.getNumArguments() == 1) {
-        base = createBase(entryBuilder, function.getLoc());
-        values[function.getArgument(0)] = base->getResult(0);
+      // BaseOp 不发射机器指令，只表达 kernel 参数引用。
+      // 先为所有参数创建 base，再处理原始 TTGIR 操作，保证参数可以被任意
+      // 后续 addptr/load/store 使用，同时保留每个参数自己的 arg_index。
+      llvm::SmallPtrSet<Operation *, 4> baseOps;
+      for (unsigned argIndex = 0; argIndex < function.getNumArguments();
+           ++argIndex) {
+        Operation *base = createBase(entryBuilder, function.getLoc(), argIndex);
+        baseOps.insert(base);
+        values[function.getArgument(argIndex)] = base->getResult(0);
       }
 
       llvm::SmallVector<Operation *> original;
       for (Operation &operation : entry)
-        if (&operation != base)
+        if (!baseOps.count(&operation))
           original.push_back(&operation);
 
       for (Operation *operation : original) {
