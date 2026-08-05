@@ -1,17 +1,46 @@
-"""Triton 的最小 TinyGPU driver。
-
-这个 driver 故意保持“不激活”状态。
-这是 in-tree 后端第一版最安全的做法，因为：
-
-- Triton 不会自动把它当成默认 runtime driver
-- compile-only 验证仍然可以通过显式 target 完成
-- 后面接仿真器时，不需要一开始就复制 CUDA/HIP 的运行时行为
-"""
+"""将 Triton kernel launch 接到 ``tools/tinygpu_sim.py`` 的执行模型。"""
 
 from __future__ import annotations
+import os
 
 from triton.backends.compiler import GPUTarget
 from triton.backends.driver import DriverBase
+
+from .simulator import THREADS_PER_BLOCK, run_tinygpu_kernel
+
+class TinyGPUUtils:
+    """满足 CompiledKernel 初始化所需的最小 device-utils 接口。"""
+    @staticmethod
+    def get_device_properties(device):
+        del device
+        # 仿真器没有正式的硬件资源限制：shared memory的正式资源留给后续教程
+        return {"max_shared_mem": 64}
+
+    @staticmethod
+    def load_binary(name, binary, shared, device):
+        # 把 tinybin 直接作为 CompiledKernel.function 返回给 launcher
+        del name, shared, device
+        # CompiledKernel 只要求 module 为非 None 来表示初始化完成。function 保存
+        # 原始 tinybin，TinyGPULauncher 收到后直接传给仿真器桥接层。
+        return object(), bytes(binary), 0, 0, THREADS_PER_BLOCK
+
+
+class TinyGPULauncher:
+    """Triton 的统一 launcher 调用约定到 TinyGPU runtime 的适配器。"""
+
+    def __init__(self, src, metadata):
+        del src, metadata
+
+    def __call__(self, grid_x, grid_y, grid_z, stream, function, packed_metadata,
+                 launch_metadata, launch_enter_hook, launch_exit_hook, *arguments):
+        del stream, packed_metadata
+        if launch_enter_hook is not None:
+            launch_enter_hook(launch_metadata)
+
+        run_tinygpu_kernel(function, (grid_x, grid_y, grid_z), arguments)
+
+        if launch_exit_hook is not None:
+            launch_exit_hook(launch_metadata)
 
 
 class TinyGPUDriver(DriverBase):
@@ -21,11 +50,17 @@ class TinyGPUDriver(DriverBase):
     即使我们现在不做真实 launch，也要把这个类补齐，这样后端结构才完整。
     """
 
+    def __init__(self):
+        self.utils = TinyGPUUtils()
+        self.launcher_cls = TinyGPULauncher
+
     @classmethod
     def is_active(cls):
-        """返回 `False`，避免 Triton 自动把它选成活动 runtime。"""
-
-        return False
+        """
+        默认不抢占 CUDA/HIP driver。教程测试通过 driver.set_active() 显式选择
+        TinyGPU；需要自动发现时，用户可设置此环境变量
+        """
+        return os.environ.get("TRITON_TINYGPU_SIM") == "1"
 
     def get_current_target(self):
         """为显式 compile-only 流程返回一个默认 TinyGPU target。"""
@@ -33,12 +68,23 @@ class TinyGPUDriver(DriverBase):
 
     def get_active_torch_device(self):
         """为了满足接口而保留，虽然现在并没有真实设备。
-
-        对 compile-only 场景来说，返回 `0` 没问题，因为这个 driver 本来就不该
-        成为活动 runtime driver。
+        仿真器使用 CPU tensor 作为 host memory 的输入与输出。
         """
+        import torch
 
+        return torch.device("cpu")
+
+    def get_current_device(self):
         return 0
+
+    def set_current_device(self, device):
+        if device != 0:
+            raise ValueError("TinyGPU simulator exposes only device 0")
+
+    def get_current_stream(self, device):
+        if device != 0:
+            raise ValueError("TinyGPU simulator exposes only device 0")
+        return None
 
     def get_benchmarker(self):
         """返回一个假的 benchmarker。

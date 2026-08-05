@@ -84,10 +84,10 @@ class TinyGPUBackend(BaseBackend):
     return TinyGPUOptions(**args)
 
   def pack_metadata(self, metadata):
-    """
-    返回后端自己的launch metadata 打包结果
+    """ 返回后端自己的launch metadata 打包结果
     - CUDA/HIP 会在这里准备运行期 launch 所需的信息。
     - 我们这个后端不会真的 launch，所以先返回空 tuple 就够了。
+    - simulator launcher 直接接收 tinybin，不需要额外的二进制 metadata。
     """
     del metadata
     return ()
@@ -162,7 +162,7 @@ class TinyGPUBackend(BaseBackend):
 
   @staticmethod
   def _set_metadata(metadata):
-    # 当前没有runtime launcher； 先补齐CompiledKernel读取的最小metadata
+    # 补齐 CompiledKernel 和 simulator launcher 读取的最小 metadata。
     metadata["name"] = "tinygpu_kernel"
     metadata["shared"] = 0
     metadata["cluster_dims"] = (1, 1, 1)

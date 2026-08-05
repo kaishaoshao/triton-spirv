@@ -87,3 +87,12 @@ docs/sg_execution_times.rst
 
 # macOS
 .DS_Store
+
+build.cachebad-20260712-1249/*
+
+# 网页仿真器可由 package-lock.json 重建的依赖和构建产物。
+tools/tinygpu-simulator-web/node_modules/
+tools/tinygpu-simulator-web/dist/
+
+
+
